@@ -1,0 +1,21 @@
+                    check  value
+      Closed (any time) %   91.0
+   Repaid on/before due %   81.6
+  Closed before disbursed    0.0
+Missing disbursement_date 1241.0
+         Missing due_date    0.0
+      Missing closed_date 3777.0
+
+loan_status
+Repaid         37838
+Written off     1497
+Overdue         1222
+Active          1011
+repaid           291
+REPAID           262
+written off       15
+active            10
+ACTIVE             9
+overdue            7
+WRITTEN OFF        3
+OVERDUE            3
