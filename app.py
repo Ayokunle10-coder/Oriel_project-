@@ -4,6 +4,7 @@ Run from the project root:  streamlit run app.py
 Data loading lives in core.py (shared with api.py).
 """
 import altair as alt
+import numpy as np
 import streamlit as st
 
 import core
@@ -38,8 +39,8 @@ if res is None:
 d, m, pu, worklist, asof = res["d"], res["m"], res["pu"], res["worklist"], res["asof"]
 st.caption(f"Data as of {asof.date()} | {len(d):,} unique loans")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Overview", "Payment failures", "Repayment drivers", "Recovery worklist"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Overview", "Payment failures", "Repayment drivers", "Recovery worklist", "Predict"])
 
 # ---- Overview
 with tab1:
@@ -101,22 +102,93 @@ with tab3:
 
 # ---- Recovery worklist
 with tab4:
-    st.subheader("Overdue loans and recommended action")
-    summary = (worklist.groupby("action")
+    ev = res["model_eval"]
+    st.subheader("Daily prioritised call list")
+    st.caption(
+        f"Ranked by expected loss = P(write-off) x outstanding balance. Loans more than "
+        f"{core.WORK_WINDOW_DPD} days past due go to the recovery track: in the history, "
+        "no late loan was repaid after about 31 days past due.")
+
+    summary = (worklist.groupby(["stage", "action"])
                .agg(loans=("loan_id", "size"),
                     outstanding_gbp=("outstanding_gbp", "sum"),
+                    expected_loss_gbp=("expected_loss_gbp", "sum"),
+                    avg_p_writeoff=("p_writeoff", "mean"),
                     avg_days_past_due=("days_past_due", "mean")))
-    show(summary, {"loans": INT, "outstanding_gbp": GBP, "avg_days_past_due": INT})
+    show(summary, {"loans": INT, "outstanding_gbp": GBP, "expected_loss_gbp": GBP,
+                   "avg_p_writeoff": PCT, "avg_days_past_due": INT})
 
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns(3)
+    all_stages = sorted(worklist["stage"].unique(), reverse=True)
+    stages = f1.multiselect("Stage", all_stages, default=all_stages[:1])
     all_actions = sorted(worklist["action"].unique())
-    actions = f1.multiselect("Action", all_actions, default=all_actions)
-    min_out = f2.number_input("Minimum outstanding (GBP)", min_value=0.0, value=0.0, step=100.0)
+    actions = f2.multiselect("Action", all_actions, default=all_actions)
+    min_out = f3.number_input("Minimum outstanding (GBP)", min_value=0.0, value=0.0, step=100.0)
 
-    view = worklist[worklist["action"].isin(actions) & (worklist["outstanding_gbp"] >= min_out)]
-    st.write(f"{len(view):,} loans | £{view['outstanding_gbp'].sum():,.0f} outstanding")
-    st.dataframe(view.style.format({"outstanding_gbp": "£{:,.2f}", "days_past_due": INT,
-                                    "payday": INT}, na_rep=""),
+    view = worklist[worklist["stage"].isin(stages) & worklist["action"].isin(actions)
+                    & (worklist["outstanding_gbp"] >= min_out)]
+    st.write(f"{len(view):,} loans | £{view['outstanding_gbp'].sum():,.0f} outstanding | "
+             f"£{view['expected_loss_gbp'].sum():,.0f} expected loss")
+    st.dataframe(view.style.format({"outstanding_gbp": "£{:,.2f}", "expected_loss_gbp": "£{:,.2f}",
+                                    "p_writeoff": PCT, "days_past_due": INT, "payday": INT},
+                                   na_rep=""),
                  width="stretch", hide_index=True)
+
+    with st.expander("How good is the roll-to-default model?"):
+        st.write(
+            f"Logistic regression trained on {ev['train_loans']:,} late loans, tested on the "
+            f"{ev['test_loans']:,} newest (due after {ev['test_from'].date()}). "
+            f"Test AUC {ev['auc']:.3f} vs {ev['auc_dpd_only']:.3f} using days past due alone. "
+            "Ranking power is modest in the first week past due, so use the score to order "
+            "the list, not as a verdict on a customer.")
+        st.write(f"Share of later write-off £ reached by calling the top "
+                 f"{ev['capacity']:.0%} of newly overdue loans:")
+        show(ev["gbp_reached"].rename("gbp_reached").to_frame(), {"gbp_reached": PCT})
+        show(ev["auc_by_dpd"].rename("AUC").rename_axis("days_past_due").to_frame(),
+             {"AUC": "{:.3f}"})
     st.download_button("Download worklist (CSV)", view.to_csv(index=False),
                        file_name="recovery_worklist.csv", mime="text/csv")
+
+# ---- Predict: score a single overdue loan
+with tab5:
+    st.subheader("Predict roll into default for one overdue loan")
+    st.caption("Enter what you know about the loan today. Fields not shown take typical values "
+               "from past late loans. The model is the same one that ranks the call list.")
+    snaps, risk_model = res["snaps"], res["risk_model"]
+    opts = lambda col: sorted(snaps[col].dropna().unique().tolist())
+
+    with st.form("predict"):
+        a, b, c = st.columns(3)
+        dpd = a.number_input("Days past due", 1, 90, 3)
+        balance = a.number_input("Outstanding balance (GBP)", 0.0, 5000.0, 400.0, step=50.0)
+        term = a.number_input("Loan term (days)", 7, 120, 30)
+        method = b.selectbox("Repayment method", opts("repayment_method"))
+        reason = b.selectbox("Last failure reason on/before due date",
+                             ["None (no failed attempt)"] + opts("last_fail_reason_due"))
+        contactable = b.checkbox("Contactable (SMS opt-in and valid phone)", value=True)
+        post_paid = c.number_input("Paid since due date (GBP)", 0.0, 5000.0, 0.0, step=10.0)
+        post_fails = c.number_input("Failed attempts since due date", 0, 10, 0)
+        since_last = c.number_input("Days since last payment attempt", 0, 90, int(dpd))
+        employment = st.selectbox("Employment status", opts("employment_status"))
+        submitted = st.form_submit_button("Predict")
+
+    if submitted:
+        failed = reason != "None (no failed attempt)"
+        p = core.predict_one(
+            risk_model, snaps,
+            dpd=dpd, balance_now=balance, outstanding_at_due=balance + post_paid,
+            term_days=term, repayment_method=method, contactable=int(contactable),
+            last_fail_reason_due=reason if failed else np.nan, n_fail_due=int(failed),
+            post_paid=post_paid, post_fails=post_fails,
+            post_attempts=post_fails + (1 if post_paid > 0 else 0),
+            days_since_last_attempt=since_last, employment_status=employment)
+        action = core._action({"days_past_due": dpd, "contactable": contactable,
+                               "last_fail": reason if failed else None})
+        r1, r2, r3 = st.columns(3)
+        r1.metric("P(written off)", f"{p:.0%}")
+        r2.metric("Expected loss", f"£{p * balance:,.0f}")
+        r3.metric("Stage", "Work now" if dpd <= core.WORK_WINDOW_DPD else "Recovery track")
+        st.success(f"Recommended action: {action}")
+        st.caption(f"Average write-off rate of late loans in training: "
+                   f"{snaps.drop_duplicates('loan_id')['written_off'].mean():.0%}. "
+                   "Use this as a ranking aid, not a verdict on the customer.")
